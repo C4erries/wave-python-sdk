@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wavemq"
+version = "0.1.0"
+description = "Python SDK for wave-mq binary protocol"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Pavel" }]
+license = { file = "LICENSE" }
+keywords = ["wave-mq", "messaging", "client", "binary-protocol"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+]
+
+[project.urls]
+Homepage = "https://example.invalid/wavemq"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
