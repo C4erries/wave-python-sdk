@@ -1,11 +1,23 @@
 from __future__ import annotations
 
+import base64
+import json
 import socket
 import threading
 import time
-from typing import Iterable, Sequence
+from datetime import datetime, timezone
+from typing import Any, Iterable, Sequence
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 
-from .errors import WaveMQConnectionError, WaveMQProtocolError, broker_exception_for_error_code
+from .errors import (
+    UnsupportedFeatureError,
+    WaveMQConnectionError,
+    WaveMQProtocolError,
+    broker_exception_for_error_code,
+    broker_exception_for_http,
+)
 from .models import (
     CommitOffsetResult,
     CreateTopicResult,
@@ -14,6 +26,7 @@ from .models import (
     ListOffsetsResult,
     MetadataResult,
     PartitionMetadata,
+    PartitionRole,
     PingResult,
     ProduceResult,
     Record,
@@ -119,6 +132,171 @@ class _TcpTransport:
         return sock
 
 
+class _HttpTransport:
+    def __init__(self, broker: str, timeout: float) -> None:
+        self._base_url = _normalize_http_broker(broker)
+        self._timeout = timeout
+
+    @property
+    def broker(self) -> str:
+        return self._base_url
+
+    def close(self) -> None:
+        return None
+
+    def ping(self) -> PingResult:
+        started = time.perf_counter()
+        self._request_text("GET", "/healthz")
+        return PingResult(rtt_ms=(time.perf_counter() - started) * 1000.0)
+
+    def create_topic(self, topic: str, partitions: int, replication_factor: int) -> CreateTopicResult:
+        payload = {
+            "name": topic,
+            "partitions": partitions,
+            "replicationFactor": replication_factor,
+        }
+        try:
+            self._request_json("POST", "/api/topics", payload=payload)
+        except HTTPError as exc:
+            raise _http_error(exc, broker=self.broker, action=f"create-topic {topic}") from exc
+        return CreateTopicResult(topic=topic, partitions=partitions, replication_factor=replication_factor)
+
+    def produce(self, topic: str, partition: int, records: Sequence[Record]) -> ProduceResult:
+        if not records:
+            raise ValueError("records must not be empty")
+
+        base_offset: int | None = None
+        path = f"/api/topics/{quote(topic, safe='')}/partitions/{partition}/messages"
+        for record in records:
+            if record.headers:
+                raise UnsupportedFeatureError(
+                    "http transport does not support record headers",
+                    broker=self.broker,
+                )
+            payload: dict[str, Any] = {"value": _encode_record_bytes(record.value)}
+            if record.key is not None:
+                payload["key"] = _encode_record_bytes(record.key)
+            try:
+                data = self._request_json("POST", path, payload=payload)
+            except HTTPError as exc:
+                raise _http_error(exc, broker=self.broker, action=f"produce {topic}/{partition}") from exc
+            if base_offset is None:
+                base_offset = int(data["baseOffset"])
+        return ProduceResult(base_offset=0 if base_offset is None else base_offset)
+
+    def fetch(self, topic: str, partition: int, offset: int, max_bytes: int = 1_048_576) -> FetchResult:
+        _ = max_bytes
+        partition_detail = self._partition_detail(topic, partition)
+        high_watermark = partition_detail.high_watermark
+        if high_watermark < offset:
+            return FetchResult(records=(), high_watermark=high_watermark)
+        limit = max(1, high_watermark - offset + 1)
+        path = (
+            f"/api/topics/{quote(topic, safe='')}/partitions/{partition}/messages"
+            f"?offset={high_watermark}&limit={limit}"
+        )
+        try:
+            data = self._request_json("GET", path)
+        except HTTPError as exc:
+            raise _http_error(exc, broker=self.broker, action=f"fetch {topic}/{partition}") from exc
+        if not isinstance(data, list):
+            raise WaveMQProtocolError("expected list response for fetch", broker=self.broker)
+        records = tuple(
+            item
+            for item in sorted((_record_from_http(item) for item in data), key=lambda item: item.offset)
+            if item.offset >= offset
+        )
+        return FetchResult(records=records, high_watermark=high_watermark)
+
+    def metadata(self, topics: tuple[str, ...]) -> MetadataResult:
+        requested = topics
+        if not requested:
+            try:
+                summaries = self._request_json("GET", "/api/topics")
+            except HTTPError as exc:
+                raise _http_error(exc, broker=self.broker, action="metadata") from exc
+            if not isinstance(summaries, list):
+                raise WaveMQProtocolError("expected list response for topics", broker=self.broker)
+            requested = tuple(str(item["name"]) for item in summaries if isinstance(item, dict) and "name" in item)
+
+        partitions: list[PartitionMetadata] = []
+        for topic in requested:
+            partitions.extend(self._topic_metadata(topic))
+        return MetadataResult(partitions=tuple(partitions))
+
+    def list_offsets(self, topic: str, partition: int) -> ListOffsetsResult:
+        detail = self._partition_detail(topic, partition)
+        return ListOffsetsResult(earliest=detail.start_offset, latest=detail.high_watermark)
+
+    def commit_offset(self, group: str, topic: str, partition: int, offset: int) -> CommitOffsetResult:
+        path = f"/api/consumers/{quote(group, safe='')}/topics/{quote(topic, safe='')}/partitions/{partition}/offset"
+        try:
+            self._request_json("POST", path, payload={"offset": offset})
+        except HTTPError as exc:
+            raise _http_error(exc, broker=self.broker, action=f"commit-offset {group} {topic}/{partition}") from exc
+        return CommitOffsetResult(group=group, topic=topic, partition=partition, offset=offset)
+
+    def fetch_committed(self, group: str, topic: str, partition: int) -> FetchCommittedResult:
+        path = f"/api/consumers/{quote(group, safe='')}/topics/{quote(topic, safe='')}/partitions/{partition}/offset"
+        try:
+            data = self._request_json("GET", path)
+        except HTTPError as exc:
+            raise _http_error(exc, broker=self.broker, action=f"fetch-committed {group} {topic}/{partition}") from exc
+        return FetchCommittedResult(offset=int(data["offset"]))
+
+    def _topic_metadata(self, topic: str) -> tuple[PartitionMetadata, ...]:
+        path = f"/api/topics/{quote(topic, safe='')}"
+        try:
+            data = self._request_json("GET", path)
+        except HTTPError as exc:
+            raise _http_error(exc, broker=self.broker, action=f"metadata {topic}") from exc
+        if not isinstance(data, dict):
+            raise WaveMQProtocolError("expected object response for topic detail", broker=self.broker)
+        partitions = data.get("partitions")
+        if not isinstance(partitions, list):
+            raise WaveMQProtocolError("topic detail missing partitions", broker=self.broker)
+        result: list[PartitionMetadata] = []
+        for item in partitions:
+            if not isinstance(item, dict):
+                continue
+            result.append(_partition_metadata_from_http(topic, item))
+        return tuple(result)
+
+    def _partition_detail(self, topic: str, partition: int) -> PartitionMetadata:
+        for item in self._topic_metadata(topic):
+            if item.partition == partition:
+                return item
+        raise broker_exception_for_http(
+            404,
+            f"partition {partition} not found",
+            broker=self.broker,
+        )
+
+    def _request_text(self, method: str, path: str, payload: dict[str, Any] | None = None) -> str:
+        data = None if payload is None else json.dumps(payload).encode("utf-8")
+        headers = {"Accept": "application/json, text/plain;q=0.9"}
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        req = Request(self._base_url + path, data=data, headers=headers, method=method)
+        try:
+            with urlopen(req, timeout=self._timeout) as response:
+                raw = response.read()
+        except HTTPError:
+            raise
+        except URLError as exc:
+            raise WaveMQConnectionError("http request failed", broker=self.broker) from exc
+        return raw.decode("utf-8", errors="replace")
+
+    def _request_json(self, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
+        text = self._request_text(method, path, payload=payload)
+        if not text.strip():
+            return {}
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise WaveMQProtocolError("expected json response", broker=self.broker) from exc
+
+
 class WaveMQClient:
     def __init__(
         self,
@@ -130,7 +308,7 @@ class WaveMQClient:
         transport: str = "tcp",
     ) -> None:
         transport = transport.lower().strip()
-        if transport != "tcp":
+        if transport not in {"tcp", "http"}:
             raise ValueError(f"unsupported transport {transport!r}")
 
         self._broker = broker
@@ -138,7 +316,10 @@ class WaveMQClient:
         self._auto_route = bool(auto_route)
         self._metadata_cache = MetadataCache(metadata_ttl)
         self._transport_name = transport
-        self._transport = _TcpTransport(broker, timeout=self._timeout)
+        if transport == "tcp":
+            self._transport = _TcpTransport(broker, timeout=self._timeout)
+        else:
+            self._transport = _HttpTransport(broker, timeout=self._timeout)
 
     @property
     def broker(self) -> str:
@@ -162,6 +343,9 @@ class WaveMQClient:
         self.close()
 
     def ping(self) -> PingResult:
+        if self._transport_name == "http":
+            return self._transport.ping()
+
         started = time.perf_counter()
         payload = encode_ping_request()
         response = decode_ping_response(self._transport.request(API_KEY_PING, payload))
@@ -169,6 +353,9 @@ class WaveMQClient:
         return PingResult(rtt_ms=(time.perf_counter() - started) * 1000.0)
 
     def create_topic(self, topic: str, partitions: int = 1, replication_factor: int = 1) -> CreateTopicResult:
+        if self._transport_name == "http":
+            return self._transport.create_topic(topic, partitions, replication_factor)
+
         response = decode_create_topic_response(
             self._transport.request(
                 API_KEY_CREATE_TOPIC,
@@ -186,6 +373,9 @@ class WaveMQClient:
         key: bytes | str | None = None,
     ) -> ProduceResult:
         encoded_records = _coerce_records(records, key=key)
+        if self._transport_name == "http":
+            return self._transport.produce(topic, partition, encoded_records)
+
         response = decode_produce_response(
             self._transport.request(API_KEY_PRODUCE, encode_produce_request(topic, partition, encoded_records))
         )
@@ -199,6 +389,9 @@ class WaveMQClient:
         offset: int,
         max_bytes: int = 1_048_576,
     ) -> FetchResult:
+        if self._transport_name == "http":
+            return self._transport.fetch(topic, partition, offset, max_bytes=max_bytes)
+
         response = decode_fetch_response(
             self._transport.request(API_KEY_FETCH, encode_fetch_request(topic, partition, offset, max_bytes))
         )
@@ -211,15 +404,21 @@ class WaveMQClient:
         if cached is not None:
             return cached
 
-        response = decode_metadata_response(
-            self._transport.request(API_KEY_METADATA, encode_metadata_request(topics_tuple))
-        )
-        self._raise_for_error(response.error, "metadata")
-        result = MetadataResult(partitions=response.partitions)
+        if self._transport_name == "http":
+            result = self._transport.metadata(topics_tuple)
+        else:
+            response = decode_metadata_response(
+                self._transport.request(API_KEY_METADATA, encode_metadata_request(topics_tuple))
+            )
+            self._raise_for_error(response.error, "metadata")
+            result = MetadataResult(partitions=response.partitions)
         self._metadata_cache.set(topics_tuple, result)
         return result
 
     def list_offsets(self, topic: str, partition: int) -> ListOffsetsResult:
+        if self._transport_name == "http":
+            return self._transport.list_offsets(topic, partition)
+
         response = decode_list_offsets_response(
             self._transport.request(API_KEY_LIST_OFFSETS, encode_list_offsets_request(topic, partition))
         )
@@ -227,6 +426,9 @@ class WaveMQClient:
         return ListOffsetsResult(earliest=response.earliest, latest=response.latest)
 
     def commit_offset(self, group: str, topic: str, partition: int, offset: int) -> CommitOffsetResult:
+        if self._transport_name == "http":
+            return self._transport.commit_offset(group, topic, partition, offset)
+
         response = decode_commit_offset_response(
             self._transport.request(
                 API_KEY_COMMIT_OFFSET,
@@ -237,6 +439,9 @@ class WaveMQClient:
         return CommitOffsetResult(group=group, topic=topic, partition=partition, offset=offset)
 
     def fetch_committed(self, group: str, topic: str, partition: int) -> FetchCommittedResult:
+        if self._transport_name == "http":
+            return self._transport.fetch_committed(group, topic, partition)
+
         response = decode_fetch_committed_response(
             self._transport.request(
                 API_KEY_FETCH_COMMITTED,
@@ -286,3 +491,82 @@ def _coerce_records(records: Sequence[Record | bytes | str], key: bytes | str | 
         normalized.append(Record(key=key_bytes, value=value))
 
     return tuple(normalized)
+
+
+def _normalize_http_broker(broker: str) -> str:
+    broker = broker.strip()
+    if not broker:
+        raise ValueError("invalid broker address ''")
+    if "://" not in broker:
+        broker = "http://" + broker
+    return broker.rstrip("/")
+
+
+def _decode_maybe_base64(value: Any) -> bytes | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return str(value).encode("utf-8")
+    if value.startswith("base64:"):
+        return base64.b64decode(value[7:])
+    return value.encode("utf-8")
+
+
+def _encode_record_bytes(value: bytes | None) -> str:
+    if value is None:
+        return ""
+    try:
+        text = value.decode("utf-8")
+    except UnicodeDecodeError:
+        return "base64:" + base64.b64encode(value).decode("ascii")
+    if text.startswith("base64:"):
+        return "base64:" + base64.b64encode(value).decode("ascii")
+    return text
+
+
+def _record_from_http(data: dict[str, Any]) -> Record:
+    timestamp_text = str(data.get("timestamp", ""))
+    if timestamp_text.endswith("Z"):
+        timestamp_text = timestamp_text[:-1] + "+00:00"
+    timestamp = datetime.fromisoformat(timestamp_text) if timestamp_text else datetime.now(timezone.utc)
+    return Record(
+        offset=int(data.get("offset", -1)),
+        timestamp=timestamp,
+        key=_decode_maybe_base64(data.get("key")),
+        value=_decode_maybe_base64(data.get("value")),
+    )
+
+
+def _partition_metadata_from_http(topic: str, data: dict[str, Any]) -> PartitionMetadata:
+    role_text = str(data.get("role", "leader")).strip().lower()
+    role = PartitionRole.LEADER if role_text == "leader" else PartitionRole.FOLLOWER
+    replicas = tuple(int(item) for item in data.get("replicas", ()))
+    isr = tuple(int(item) for item in data.get("isr", ()))
+    return PartitionMetadata(
+        topic=topic,
+        partition=int(data["id"]),
+        broker_id=int(data.get("leader", 0)),
+        role=role,
+        leader_epoch=int(data.get("leaderEpoch", 0)),
+        start_offset=int(data.get("startOffset", 0)),
+        high_watermark=int(data.get("highWatermark", -1)),
+        leader=int(data.get("leader", 0)),
+        replicas=replicas,
+        isr=isr,
+    )
+
+
+def _http_error(exc: HTTPError, *, broker: str, action: str) -> Exception:
+    raw = exc.read()
+    text = raw.decode("utf-8", errors="replace")
+    data: dict[str, Any] | None = None
+    if text.strip():
+        try:
+            payload = json.loads(text)
+            if isinstance(payload, dict):
+                data = payload
+        except json.JSONDecodeError:
+            data = None
+    message = text.strip() or f"http {exc.code} during {action}"
+    error = data.get("error") if data else None
+    return broker_exception_for_http(exc.code, message, broker=broker, error=error)

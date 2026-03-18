@@ -5,6 +5,7 @@ from .errors import (
     PartitionNotFoundError,
     TopicExistsError,
     TopicNotFoundError,
+    UnsupportedFeatureError,
     WaveMQBrokerError,
     WaveMQConnectionError,
     WaveMQError,
@@ -36,6 +37,7 @@ __all__ = [
     "TopicExistsError",
     "NotLeaderError",
     "InvalidRequestError",
+    "UnsupportedFeatureError",
     "Header",
     "Record",
     "PartitionRole",
@@ -49,4 +51,3 @@ __all__ = [
     "CommitOffsetResult",
     "FetchCommittedResult",
 ]
-

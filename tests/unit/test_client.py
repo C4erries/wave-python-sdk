@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import json
 import socket
+import socketserver
 import sys
 import threading
 import unittest
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
@@ -93,13 +97,164 @@ class FakeWaveMQServer:
                     break
 
 
+class _ThreadingHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+class FakeWaveMQHTTPServer:
+    def __init__(self) -> None:
+        self.state = {
+            "messages": [],
+            "next_offset": 3,
+            "metadata_calls": 0,
+            "committed_offset": 4,
+        }
+        handler = self._make_handler()
+        self._server = _ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    @property
+    def broker(self) -> str:
+        host, port = self._server.server_address
+        return f"http://{host}:{port}"
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
+
+    def _make_handler(self):
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                parsed = urlparse(self.path)
+                if parsed.path == "/healthz":
+                    self._write_text(200, "ok")
+                    return
+                if parsed.path == "/api/topics":
+                    self._write_json(
+                        200,
+                        [
+                            {"name": "demo", "partitions": 1, "replicationFactor": 1},
+                        ],
+                    )
+                    return
+                if parsed.path == "/api/topics/demo":
+                    outer.state["metadata_calls"] += 1
+                    self._write_json(200, self._topic_detail())
+                    return
+                if parsed.path == "/api/topics/demo/partitions/0/messages":
+                    qs = parse_qs(parsed.query)
+                    target = int(qs.get("offset", ["0"])[0])
+                    limit = int(qs.get("limit", ["50"])[0])
+                    records = [item for item in outer.state["messages"] if item["offset"] <= target]
+                    if len(records) > limit:
+                        records = records[-limit:]
+                    self._write_json(200, list(reversed(records)))
+                    return
+                if parsed.path == "/api/consumers/g/topics/demo/partitions/0/offset":
+                    self._write_json(
+                        200,
+                        {
+                            "group": "g",
+                            "topic": "demo",
+                            "partition": 0,
+                            "offset": outer.state["committed_offset"],
+                        },
+                    )
+                    return
+                self.send_error(404)
+
+            def do_POST(self) -> None:  # noqa: N802
+                parsed = urlparse(self.path)
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length) if length else b""
+                data = json.loads(body.decode("utf-8") or "{}")
+                if parsed.path == "/api/topics":
+                    self._write_json(200, self._topic_detail())
+                    return
+                if parsed.path == "/api/topics/demo/partitions/0/messages":
+                    offset = outer.state["next_offset"]
+                    outer.state["next_offset"] += 1
+                    outer.state["messages"].append(
+                        {
+                            "partition": 0,
+                            "offset": offset,
+                            "key": data.get("key"),
+                            "value": data.get("value"),
+                            "timestamp": "2026-03-18T10:00:00Z",
+                        }
+                    )
+                    self._write_json(200, {"partition": 0, "baseOffset": offset})
+                    return
+                if parsed.path == "/api/consumers/g/topics/demo/partitions/0/offset":
+                    outer.state["committed_offset"] = int(data["offset"])
+                    self._write_json(
+                        200,
+                        {
+                            "group": "g",
+                            "topic": "demo",
+                            "partition": 0,
+                            "offset": outer.state["committed_offset"],
+                        },
+                    )
+                    return
+                self.send_error(404)
+
+            def log_message(self, format: str, *args) -> None:  # noqa: A003
+                return
+
+            def _topic_detail(self) -> dict[str, object]:
+                return {
+                    "name": "demo",
+                    "partitionCount": 1,
+                    "replicationFactor": 1,
+                    "partitions": [
+                        {
+                            "id": 0,
+                            "leader": 1,
+                            "role": "leader",
+                            "highWatermark": outer.state["next_offset"] - 1,
+                            "startOffset": 0,
+                            "replicas": [1],
+                            "isr": [1],
+                            "leaderEpoch": 1,
+                        }
+                    ],
+                }
+
+            def _write_json(self, status: int, payload: object) -> None:
+                encoded = json.dumps(payload).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def _write_text(self, status: int, payload: str) -> None:
+                encoded = payload.encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+        return Handler
+
+
 class ClientTests(unittest.TestCase):
     def test_transport_selection(self) -> None:
         client = WaveMQClient("127.0.0.1:1")
         self.assertEqual("tcp", client.transport)
         client.close()
+        http_client = WaveMQClient("127.0.0.1:8090", transport="http")
+        self.assertEqual("http", http_client.transport)
+        http_client.close()
         with self.assertRaises(ValueError):
-            WaveMQClient("127.0.0.1:1", transport="http")
+            WaveMQClient("127.0.0.1:1", transport="ftp")
 
     def test_tcp_roundtrip_and_cache(self) -> None:
         metadata_calls = {"count": 0}
@@ -183,6 +338,33 @@ class ClientTests(unittest.TestCase):
         finally:
             server.close()
             server.assert_ok()
+
+    def test_http_roundtrip_and_cache(self) -> None:
+        server = FakeWaveMQHTTPServer()
+        try:
+            with WaveMQClient(server.broker, transport="http", metadata_ttl=60.0) as client:
+                self.assertEqual("http", client.transport)
+                self.assertGreaterEqual(client.ping().rtt_ms, 0.0)
+                created = client.create_topic("demo", partitions=1, replication_factor=1)
+                self.assertEqual("demo", created.topic)
+                produced = client.produce("demo", 0, ["hello", "world"], key="demo-key")
+                self.assertEqual(3, produced.base_offset)
+                fetched = client.fetch("demo", 0, offset=3)
+                self.assertEqual(2, len(fetched.records))
+                self.assertEqual(b"hello", fetched.records[0].value)
+                self.assertEqual(4, fetched.high_watermark)
+                metadata = client.metadata("demo")
+                self.assertEqual(1, len(metadata.partitions))
+                self.assertEqual(1, metadata.partitions[0].broker_id)
+                metadata_calls = server.state["metadata_calls"]
+                self.assertEqual(1, len(client.metadata("demo").partitions))
+                self.assertEqual(metadata_calls, server.state["metadata_calls"])
+                self.assertEqual(0, client.list_offsets("demo", 0).earliest)
+                self.assertEqual(4, client.list_offsets("demo", 0).latest)
+                self.assertEqual(5, client.commit_offset("g", "demo", 0, 5).offset)
+                self.assertEqual(5, client.fetch_committed("g", "demo", 0).offset)
+        finally:
+            server.close()
 
 
 if __name__ == "__main__":
