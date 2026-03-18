@@ -1,7 +1,7 @@
 # План создания `wave-python-sdk`
 
 ## Кратко
-- Сделать полноценный Python SDK для `wave-mq`, который работает по custom binary protocol `wave-mq` поверх TCP и не зависит от `mbctl`.
+- Сделать полноценный Python SDK для `wave-mq`, который работает по custom binary protocol `wave-mq` поверх TCP и не зависит от `mbctl`
 - Клиент знает только seed broker address (`host:port`) и не зависит от того, где запущен брокер: локально, в Docker или на удаленном сервере.
 - `mbctl` остаётся CLI-инструментом для ручных проверок, а `wave-python-sdk` становится библиотекой для приложений.
 - Первая версия SDK синхронная, без async API, без HTTP и без MQTT.
