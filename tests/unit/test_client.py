@@ -32,12 +32,14 @@ from wavemq.protocol import (  # noqa: E402
     API_KEY_METADATA,
     API_KEY_PING,
     API_KEY_PRODUCE,
+    API_KEY_PRODUCE_BY_KEY,
     decode_commit_offset_request,
     decode_create_topic_request,
     decode_fetch_committed_request,
     decode_fetch_request,
     decode_list_offsets_request,
     decode_metadata_request,
+    decode_produce_by_key_request,
     decode_produce_request,
     encode_commit_offset_response,
     encode_create_topic_response,
@@ -46,6 +48,7 @@ from wavemq.protocol import (  # noqa: E402
     encode_list_offsets_response,
     encode_metadata_response,
     encode_ping_response,
+    encode_produce_by_key_response,
     encode_produce_response,
     encode_response_frame,
     encode_frame,
@@ -201,6 +204,22 @@ class FakeWaveMQHTTPServer:
                     )
                     self._write_json(200, {"partition": 0, "baseOffset": offset})
                     return
+                if parsed.path == "/api/topics/demo/messages":
+                    offset = outer.state["next_offset"]
+                    outer.state["next_offset"] += 1
+                    content_type = data.get("contentType")
+                    outer.state["messages"].append(
+                        {
+                            "partition": 0,
+                            "offset": offset,
+                            "key": data.get("key"),
+                            "value": data.get("value"),
+                            "contentType": content_type,
+                            "timestamp": "2026-03-18T10:00:00Z",
+                        }
+                    )
+                    self._write_json(200, {"partition": 0, "baseOffset": offset})
+                    return
                 if parsed.path == "/api/consumers/g/topics/demo/partitions/0/offset":
                     outer.state["committed_offset"] = int(data["offset"])
                     self._write_json(
@@ -269,6 +288,7 @@ class ClientTests(unittest.TestCase):
 
     def test_tcp_roundtrip_and_cache(self) -> None:
         metadata_calls = {"count": 0}
+        partition_produce_calls = {"count": 0}
 
         def handler(api_key, payload):
             if api_key == API_KEY_PING:
@@ -277,6 +297,18 @@ class ClientTests(unittest.TestCase):
             if api_key == API_KEY_CREATE_TOPIC:
                 self.assertEqual(("demo", 1, 1), decode_create_topic_request(payload))
                 return api_key, encode_create_topic_response(0)
+            if api_key == API_KEY_PRODUCE_BY_KEY:
+                topic, key, records = decode_produce_by_key_request(payload)
+                self.assertEqual("demo", topic)
+                self.assertEqual(b"demo-key", key)
+                self.assertEqual(1, len(records))
+                self.assertEqual(b"hello", records[0].value)
+                self.assertEqual("application/json", records[0].content_type)
+                self.assertEqual(
+                    (Header("content-type", b"application/json"),),
+                    records[0].headers,
+                )
+                return api_key, encode_produce_by_key_response(0, 3, 0)
             if api_key == API_KEY_PRODUCE:
                 topic, partition, records = decode_produce_request(payload)
                 self.assertEqual("demo", topic)
@@ -284,11 +316,7 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(1, len(records))
                 self.assertEqual(b"demo-key", records[0].key)
                 self.assertEqual(b"hello", records[0].value)
-                self.assertEqual("application/json", records[0].content_type)
-                self.assertEqual(
-                    (Header("content-type", b"application/json"),),
-                    records[0].headers,
-                )
+                partition_produce_calls["count"] += 1
                 return api_key, encode_produce_response(3, 0)
             if api_key == API_KEY_FETCH:
                 self.assertEqual(("demo", 0, 0, 1_048_576), decode_fetch_request(payload))
@@ -337,10 +365,12 @@ class ClientTests(unittest.TestCase):
                     3,
                     client.produce(
                         "demo",
-                        0,
                         [Record(key=b"demo-key", value=b"hello", content_type="application/json")],
                     ).base_offset,
                 )
+                explicit = client.produce_to_partition("demo", 0, [Record(key=b"demo-key", value=b"hello")])
+                self.assertEqual(0, explicit.partition)
+                self.assertEqual(1, partition_produce_calls["count"])
                 fetched = client.fetch("demo", 0, 0)
                 self.assertEqual(2, len(fetched.records))
                 self.assertEqual(b"hello", fetched.records[0].value)
@@ -441,10 +471,10 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual("demo", created.topic)
                 produced = client.produce(
                     "demo",
-                    0,
                     [Record(key=b"demo-key", value=b"hello", content_type="text/plain")],
                 )
                 self.assertEqual(3, produced.base_offset)
+                self.assertEqual(0, produced.partition)
                 fetched = client.fetch("demo", 0, offset=3)
                 self.assertEqual(1, len(fetched.records))
                 self.assertEqual(b"hello", fetched.records[0].value)
@@ -474,10 +504,10 @@ class ClientTests(unittest.TestCase):
             with WaveMQClient(server.broker, transport="http") as client:
                 produced = client.produce(
                     "demo",
-                    0,
-                    [Record(value=bytes.fromhex("4029000000000000"), content_type="application/x.float64")],
+                    [Record(key=b"demo-key", value=bytes.fromhex("4029000000000000"), content_type="application/x.float64")],
                 )
                 self.assertEqual(3, produced.base_offset)
+                self.assertEqual(0, produced.partition)
                 self.assertEqual("application/x.float64", server.state["messages"][0]["contentType"])
                 self.assertEqual("base64:QCkAAAAAAAA=", server.state["messages"][0]["value"])
 
@@ -494,8 +524,7 @@ class ClientTests(unittest.TestCase):
             with self.assertRaises(UnsupportedFeatureError):
                 client.produce(
                     "demo",
-                    0,
-                    [Record(value=b"hello", headers=(Header("x-test", b"1"),))],
+                    [Record(key=b"demo-key", value=b"hello", headers=(Header("x-test", b"1"),))],
                 )
         finally:
             client.close()
@@ -506,15 +535,23 @@ class ClientTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 client.produce(
                     "demo",
-                    0,
                     [
                         Record(
+                            key=b"demo-key",
                             value=b"hello",
                             headers=(Header("content-type", b"text/plain"),),
                             content_type="application/json",
                         )
                     ],
                 )
+        finally:
+            client.close()
+
+    def test_keyed_produce_requires_key(self) -> None:
+        client = WaveMQClient("127.0.0.1:1")
+        try:
+            with self.assertRaises(ValueError):
+                client.produce("demo", [b"hello"])
         finally:
             client.close()
 

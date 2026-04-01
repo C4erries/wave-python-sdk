@@ -12,16 +12,19 @@ from wavemq.models import Header, PartitionMetadata, PartitionRole, Record  # no
 from wavemq.protocol import (  # noqa: E402
     CURRENT_VERSION,
     API_KEY_PRODUCE,
+    API_KEY_PRODUCE_BY_KEY,
     decode_create_topic_request,
     decode_frame,
     decode_metadata_request,
     decode_metadata_response,
+    decode_produce_by_key_request,
     decode_produce_request,
     decode_record,
     encode_create_topic_request,
     encode_frame,
     encode_metadata_request,
     encode_metadata_response,
+    encode_produce_by_key_request,
     encode_produce_request,
     encode_record,
     encode_response_frame,
@@ -80,6 +83,13 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(2, len(records))
         self.assertEqual(b"a", records[0].value)
 
+        payload = encode_produce_by_key_request("demo", b"sensor-42", (Record(value=b"a"),))
+        topic, key, records = decode_produce_by_key_request(payload)
+        self.assertEqual("demo", topic)
+        self.assertEqual(b"sensor-42", key)
+        self.assertEqual(1, len(records))
+        self.assertEqual(b"a", records[0].value)
+
         metadata_payload = encode_metadata_request(("demo", "other"))
         self.assertEqual(("demo", "other"), decode_metadata_request(metadata_payload))
 
@@ -102,7 +112,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual((partition,), decoded.partitions)
 
     def test_decode_frame_rejects_bad_version(self) -> None:
-        frame = bytearray(encode_frame(API_KEY_PRODUCE, 1, b""))
+        frame = bytearray(encode_frame(API_KEY_PRODUCE_BY_KEY, 1, b""))
         frame[6:8] = (1).to_bytes(2, "big", signed=True)
         with self.assertRaises(Exception):
             decode_frame(io.BytesIO(bytes(frame)))

@@ -26,6 +26,7 @@ API_KEY_COMMIT_OFFSET = 4
 API_KEY_FETCH_COMMITTED = 5
 API_KEY_METADATA = 6
 API_KEY_PING = 7
+API_KEY_PRODUCE_BY_KEY = 8
 
 CURRENT_VERSION = 0
 FRAME_HEADER_SIZE = 14
@@ -45,6 +46,13 @@ class CreateTopicResponseWire:
 
 @dataclass(frozen=True, slots=True)
 class ProduceResponseWire:
+    base_offset: int
+    error: int
+
+
+@dataclass(frozen=True, slots=True)
+class ProduceByKeyResponseWire:
+    partition: int
     base_offset: int
     error: int
 
@@ -203,6 +211,43 @@ def encode_produce_response(base_offset: int, error: int) -> bytes:
 def decode_produce_response(payload: bytes) -> ProduceResponseWire:
     base_offset, error = _read_struct(">qh", payload)
     return ProduceResponseWire(base_offset=base_offset, error=error)
+
+
+def encode_produce_by_key_request(topic: str, key: bytes, records: Sequence[Record]) -> bytes:
+    buf = io.BytesIO()
+    _write_string(buf, topic)
+    _write_bytes(buf, key)
+    _write_int32(buf, len(records))
+    for record in records:
+        encoded = encode_record(record)
+        _write_int32(buf, len(encoded))
+        buf.write(encoded)
+    return buf.getvalue()
+
+
+def decode_produce_by_key_request(payload: bytes) -> tuple[str, bytes | None, tuple[Record, ...]]:
+    stream = io.BytesIO(payload)
+    topic = _read_string(stream)
+    key = _read_bytes(stream)
+    record_count = _read_int32(stream)
+    _validate_count(record_count, "record")
+    records = []
+    for _ in range(record_count):
+        record_len = _read_int32(stream)
+        if record_len < 0:
+            raise WaveMQProtocolError("invalid record length")
+        records.append(decode_record(io.BytesIO(_read_exact(stream, record_len))))
+    _ensure_eof(stream)
+    return topic, key, tuple(records)
+
+
+def encode_produce_by_key_response(partition: int, base_offset: int, error: int) -> bytes:
+    return struct.pack(">iqh", int(partition), int(base_offset), int(error))
+
+
+def decode_produce_by_key_response(payload: bytes) -> ProduceByKeyResponseWire:
+    partition, base_offset, error = _read_struct(">iqh", payload)
+    return ProduceByKeyResponseWire(partition=partition, base_offset=base_offset, error=error)
 
 
 def encode_fetch_request(topic: str, partition: int, offset: int, max_bytes: int) -> bytes:

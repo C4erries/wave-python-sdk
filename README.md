@@ -21,7 +21,7 @@ from wavemq import WaveMQClient
 with WaveMQClient("127.0.0.1:7912") as client:
     client.ping()
     client.create_topic("demo", partitions=1, replication_factor=1)
-    client.produce("demo", 0, ["hello"], key="demo-key")
+    client.produce("demo", ["hello"], key="demo-key")
     result = client.fetch("demo", 0, offset=0)
     print(result.records[0].value)
 ```
@@ -34,7 +34,7 @@ from wavemq import WaveMQClient
 with WaveMQClient("http://127.0.0.1:8090", transport="http") as client:
     client.ping()
     client.create_topic("demo", partitions=1, replication_factor=1)
-    client.produce("demo", 0, ["hello"], key="demo-key")
+    client.produce("demo", ["hello"], key="demo-key")
     result = client.fetch("demo", 0, offset=0)
     print(result.records[0].value)
 ```
@@ -46,6 +46,9 @@ For tiny scripts and preview examples, the client also exposes additive helpers:
 - `ensure_topic(...)`
 - `produce_one(...)`
 - `produce_many(...)`
+- `produce_to_partition(...)`
+- `produce_one_to_partition(...)`
+- `produce_many_to_partition(...)`
 - `fetch_from_offset(...)`
 - `fetch_latest(...)`
 - `resolve_consume_offset(...)`
@@ -55,6 +58,8 @@ For tiny scripts and preview examples, the client also exposes additive helpers:
 
 By default, consumer helpers resume from `committed + 1` when a group already has state.
 If the group has no committed offset yet, they start from the earliest available offset.
+The high-level `produce` path routes by key and does not let you choose the partition directly.
+If you need explicit partition control, use the `produce_*_to_partition(...)` variants.
 
 ## Examples
 

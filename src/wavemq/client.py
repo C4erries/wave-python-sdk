@@ -48,6 +48,7 @@ from .protocol import (
     API_KEY_METADATA,
     API_KEY_PING,
     API_KEY_PRODUCE,
+    API_KEY_PRODUCE_BY_KEY,
     decode_commit_offset_response,
     decode_create_topic_response,
     decode_fetch_committed_response,
@@ -56,6 +57,7 @@ from .protocol import (
     decode_list_offsets_response,
     decode_metadata_response,
     decode_ping_response,
+    decode_produce_by_key_response,
     decode_produce_response,
     encode_commit_offset_request,
     encode_create_topic_request,
@@ -65,6 +67,7 @@ from .protocol import (
     encode_list_offsets_request,
     encode_metadata_request,
     encode_ping_request,
+    encode_produce_by_key_request,
     encode_produce_request,
 )
 from .routing import MetadataCache, normalize_topics
@@ -169,7 +172,36 @@ class _HttpTransport:
             raise _http_error(exc, broker=self.broker, action=f"create-topic {topic}") from exc
         return CreateTopicResult(topic=topic, partitions=partitions, replication_factor=replication_factor)
 
-    def produce(self, topic: str, partition: int, records: Sequence[Record]) -> ProduceResult:
+    def produce_by_key(self, topic: str, key: bytes, records: Sequence[Record]) -> ProduceResult:
+        if not records:
+            raise ValueError("records must not be empty")
+
+        base_offset: int | None = None
+        chosen_partition: int | None = None
+        path = f"/api/topics/{quote(topic, safe='')}/messages"
+        encoded_key = _encode_record_bytes(key)
+        for record in records:
+            content_type = _http_record_content_type(record, broker=self.broker)
+            payload: dict[str, Any] = {
+                "key": encoded_key,
+                "value": _encode_http_record_bytes(record.value, content_type),
+            }
+            if content_type is not None:
+                payload["contentType"] = content_type
+            try:
+                data = self._request_json("POST", path, payload=payload)
+            except HTTPError as exc:
+                raise _http_error(exc, broker=self.broker, action=f"produce-by-key {topic}") from exc
+            if base_offset is None:
+                base_offset = int(data["baseOffset"])
+            if chosen_partition is None:
+                chosen_partition = int(data["partition"])
+        return ProduceResult(
+            base_offset=0 if base_offset is None else base_offset,
+            partition=chosen_partition,
+        )
+
+    def produce_to_partition(self, topic: str, partition: int, records: Sequence[Record]) -> ProduceResult:
         if not records:
             raise ValueError("records must not be empty")
 
@@ -188,7 +220,7 @@ class _HttpTransport:
                 raise _http_error(exc, broker=self.broker, action=f"produce {topic}/{partition}") from exc
             if base_offset is None:
                 base_offset = int(data["baseOffset"])
-        return ProduceResult(base_offset=0 if base_offset is None else base_offset)
+        return ProduceResult(base_offset=0 if base_offset is None else base_offset, partition=partition)
 
     def fetch(self, topic: str, partition: int, offset: int, max_bytes: int = 1_048_576) -> FetchResult:
         _ = max_bytes
@@ -396,40 +428,82 @@ class WaveMQClient:
     def produce(
         self,
         topic: str,
+        records: Sequence[Record | bytes | str],
+        *,
+        key: bytes | str | None = None,
+        content_type: str | None = None,
+    ) -> ProduceResult:
+        encoded_records = _coerce_records(records, key=key, content_type=content_type)
+        routing_key = _resolve_routing_key(encoded_records, key)
+        if self._transport_name == "http":
+            return self._transport.produce_by_key(topic, routing_key, encoded_records)
+
+        response = decode_produce_by_key_response(
+            self._transport.request(API_KEY_PRODUCE_BY_KEY, encode_produce_by_key_request(topic, routing_key, encoded_records))
+        )
+        self._raise_for_error(response.error, f"produce {topic} by key")
+        return ProduceResult(base_offset=response.base_offset, partition=response.partition)
+
+    def produce_to_partition(
+        self,
+        topic: str,
         partition: int,
         records: Sequence[Record | bytes | str],
+        *,
         key: bytes | str | None = None,
         content_type: str | None = None,
     ) -> ProduceResult:
         encoded_records = _coerce_records(records, key=key, content_type=content_type)
         if self._transport_name == "http":
-            return self._transport.produce(topic, partition, encoded_records)
+            return self._transport.produce_to_partition(topic, partition, encoded_records)
 
         response = decode_produce_response(
             self._transport.request(API_KEY_PRODUCE, encode_produce_request(topic, partition, encoded_records))
         )
         self._raise_for_error(response.error, f"produce {topic}/{partition}")
-        return ProduceResult(base_offset=response.base_offset)
+        return ProduceResult(base_offset=response.base_offset, partition=partition)
 
     def produce_one(
         self,
         topic: str,
-        partition: int,
         value: Record | bytes | str,
+        *,
         key: bytes | str | None = None,
         content_type: str | None = None,
     ) -> ProduceResult:
-        return self.produce(topic, partition, [value], key=key, content_type=content_type)
+        return self.produce(topic, [value], key=key, content_type=content_type)
+
+    def produce_one_to_partition(
+        self,
+        topic: str,
+        partition: int,
+        value: Record | bytes | str,
+        *,
+        key: bytes | str | None = None,
+        content_type: str | None = None,
+    ) -> ProduceResult:
+        return self.produce_to_partition(topic, partition, [value], key=key, content_type=content_type)
 
     def produce_many(
         self,
         topic: str,
-        partition: int,
         values: Sequence[Record | bytes | str],
+        *,
         key: bytes | str | None = None,
         content_type: str | None = None,
     ) -> ProduceResult:
-        return self.produce(topic, partition, values, key=key, content_type=content_type)
+        return self.produce(topic, values, key=key, content_type=content_type)
+
+    def produce_many_to_partition(
+        self,
+        topic: str,
+        partition: int,
+        values: Sequence[Record | bytes | str],
+        *,
+        key: bytes | str | None = None,
+        content_type: str | None = None,
+    ) -> ProduceResult:
+        return self.produce_to_partition(topic, partition, values, key=key, content_type=content_type)
 
     def fetch(
         self,
@@ -676,6 +750,31 @@ def _coerce_records(
         normalized.append(Record(key=key_bytes, value=value, content_type=normalized_content_type))
 
     return tuple(normalized)
+
+
+def _resolve_routing_key(records: Sequence[Record], key: bytes | str | None) -> bytes:
+    if isinstance(key, str):
+        explicit_key = key.encode("utf-8")
+    else:
+        explicit_key = key
+
+    if explicit_key is not None and len(explicit_key) == 0:
+        raise ValueError("key is required for keyed produce")
+
+    discovered: bytes | None = explicit_key
+    for record in records:
+        if record.key is None or len(record.key) == 0:
+            continue
+        if discovered is None:
+            discovered = record.key
+            continue
+        if discovered != record.key:
+            raise ValueError("all record keys must match for keyed produce")
+
+    if discovered is None or len(discovered) == 0:
+        raise ValueError("key is required for keyed produce")
+
+    return discovered
 
 
 def _normalize_http_broker(broker: str) -> str:

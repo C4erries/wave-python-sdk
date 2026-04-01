@@ -67,6 +67,7 @@ class EnsureTopicResult:
 @dataclass(frozen=True, slots=True)
 class ProduceResult:
     base_offset: int
+    partition: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
