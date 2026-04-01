@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: wave-python-sdk
-Version: 0.2.2
+Version: 0.2.3
 Summary: Python SDK for wave-mq binary protocol
 Author: Pavel
 License: MIT License
@@ -91,6 +91,9 @@ For tiny scripts and preview examples, the client also exposes additive helpers:
 - `consume_poll(...)`
 
 `Record` also supports `content_type`, which maps to the canonical `content-type` header on TCP and to the `contentType` JSON field on HTTP.
+
+By default, consumer helpers resume from `committed + 1` when a group already has state.
+If the group has no committed offset yet, they start from the earliest available offset.
 
 ## Examples
 
