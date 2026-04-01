@@ -53,6 +53,9 @@ For tiny scripts and preview examples, the client also exposes additive helpers:
 
 `Record` also supports `content_type`, which maps to the canonical `content-type` header on TCP and to the `contentType` JSON field on HTTP.
 
+By default, consumer helpers resume from `committed + 1` when a group already has state.
+If the group has no committed offset yet, they start from the earliest available offset.
+
 ## Examples
 
 Runnable examples live in:

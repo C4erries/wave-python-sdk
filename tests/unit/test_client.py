@@ -563,6 +563,10 @@ class ClientTests(unittest.TestCase):
                 mock.patch.object(client, "list_offsets", return_value=ListOffsetsResult(earliest=3, latest=9)),
             ):
                 self.assertEqual(
+                    3,
+                    client.resolve_consume_offset("g", "demo", 0),
+                )
+                self.assertEqual(
                     10,
                     client.resolve_consume_offset("g", "demo", 0, start_from="latest"),
                 )

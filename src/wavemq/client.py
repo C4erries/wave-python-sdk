@@ -526,7 +526,7 @@ class WaveMQClient:
         topic: str,
         partition: int,
         *,
-        start_from: str = "latest",
+        start_from: str = "earliest",
         start_offset: int = 0,
         use_committed: bool = True,
     ) -> int:
@@ -556,7 +556,7 @@ class WaveMQClient:
         partition: int,
         *,
         next_offset: int | None = None,
-        start_from: str = "latest",
+        start_from: str = "earliest",
         start_offset: int = 0,
         use_committed: bool = True,
         max_messages: int = 0,
