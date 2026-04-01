@@ -170,19 +170,19 @@
 - Параметр `transport` добавляется заранее как API-точка расширения, но фактически поддерживаемый вариант в первой версии только один: TCP.
 - Для cluster routing seed address может быть любым reachable broker, но advertised addresses в metadata должны быть доступны из сети клиента.
 
-## Planned: High-Level Helper API (No implementation in this task)
+## High-Level Helper API
 - Goal: provide a very small and beginner-friendly user `main` while keeping low-level API available.
-- Scope of this block is planning only. No code changes in SDK behavior in this task.
-- Add an additive high-level layer over `WaveMQClient` (no breaking changes):
+- Status: partially implemented in `wave-python-sdk` and still expandable without breaking the current client surface.
+- Implemented helper methods:
+  - `ensure_topic(...)` for demo/bootstrap scenarios.
+  - `fetch_from_offset(...)` for deterministic replay.
+  - `fetch_latest(...)` for reading the current tail record.
+  - `consume_poll(...)` with bounded poll loop, callback, and optional commit-after-handle flow.
+- Remaining planned helpers:
   - `produce_one(...)` / `produce_many(...)` shortcuts with sane defaults.
-  - `fetch_latest(...)` helper (read from latest visible offset semantics).
-  - `fetch_from_offset(...)` helper for deterministic replay.
-  - `consume_poll(...)` helper with bounded poll loop and typed callback.
-  - `commit_after_handle(...)` helper pattern for "process then commit" flow.
-  - `ensure_topic(...)` helper for demo/bootstrap scenarios.
-- Keep transport selection unchanged: high-level helpers must work with existing `transport` parameter and first support `tcp` (and current HTTP path where already available in SDK).
-- Error model rule: high-level helpers reuse existing typed exceptions; no new opaque error channel.
-- Documentation deliverable for this block (later):
+- Keep transport selection unchanged: helper methods must work with the existing `transport` parameter and first support `tcp` (and the current HTTP path where already available in SDK).
+- Error model rule: helper methods reuse existing typed exceptions; no new opaque error channel.
+- Documentation deliverable for the remaining helper expansion:
   - "5-line quickstart" producer example.
   - "small consumer main" example with polling + commit.
   - replay example (`start_offset`/`from_offset`) for analysis reruns.

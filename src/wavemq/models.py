@@ -54,6 +54,14 @@ class CreateTopicResult:
 
 
 @dataclass(frozen=True, slots=True)
+class EnsureTopicResult:
+    topic: str
+    partitions: int
+    replication_factor: int
+    created: bool
+
+
+@dataclass(frozen=True, slots=True)
 class ProduceResult:
     base_offset: int
 
@@ -87,3 +95,11 @@ class CommitOffsetResult:
 class FetchCommittedResult:
     offset: int
 
+
+@dataclass(frozen=True, slots=True)
+class ConsumePollResult:
+    records: Tuple[Record, ...]
+    start_offset: int
+    next_offset: int
+    high_watermark: int
+    committed_offset: int | None = None

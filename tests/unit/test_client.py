@@ -6,14 +6,23 @@ import socketserver
 import sys
 import threading
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from wavemq import WaveMQClient  # noqa: E402
-from wavemq.models import Header, PartitionMetadata, PartitionRole, Record  # noqa: E402
+from wavemq import TopicExistsError, WaveMQClient  # noqa: E402
+from wavemq.models import (  # noqa: E402
+    CreateTopicResult,
+    FetchCommittedResult,
+    FetchResult,
+    ListOffsetsResult,
+    PartitionMetadata,
+    PartitionRole,
+    Record,
+)
 from wavemq.protocol import (  # noqa: E402
     API_KEY_COMMIT_OFFSET,
     API_KEY_CREATE_TOPIC,
@@ -339,6 +348,78 @@ class ClientTests(unittest.TestCase):
             server.close()
             server.assert_ok()
 
+    def test_tcp_high_level_helpers(self) -> None:
+        state = {
+            "commits": [],
+            "fetch_offsets": [],
+        }
+
+        def handler(api_key, payload):
+            if api_key == API_KEY_CREATE_TOPIC:
+                self.assertEqual(("demo", 1, 1), decode_create_topic_request(payload))
+                return api_key, encode_create_topic_response(5)
+            if api_key == API_KEY_LIST_OFFSETS:
+                self.assertEqual(("demo", 0), decode_list_offsets_request(payload))
+                return api_key, encode_list_offsets_response(0, 1, 0)
+            if api_key == API_KEY_FETCH:
+                topic, partition, offset, max_bytes = decode_fetch_request(payload)
+                self.assertEqual("demo", topic)
+                self.assertEqual(0, partition)
+                self.assertEqual(1_048_576, max_bytes)
+                state["fetch_offsets"].append(offset)
+                if offset == 0:
+                    records = (
+                        Record(offset=0, value=b"zero"),
+                        Record(offset=1, value=b"one"),
+                    )
+                    return api_key, encode_fetch_response(records, high_watermark=1, error=0)
+                if offset == 1:
+                    records = (Record(offset=1, value=b"one"),)
+                    return api_key, encode_fetch_response(records, high_watermark=1, error=0)
+                if offset == 2:
+                    return api_key, encode_fetch_response((), high_watermark=1, error=0)
+                raise AssertionError(f"unexpected fetch offset {offset}")
+            if api_key == API_KEY_COMMIT_OFFSET:
+                state["commits"].append(decode_commit_offset_request(payload))
+                return api_key, encode_commit_offset_response(0)
+            raise AssertionError(f"unexpected api key {api_key}")
+
+        server = FakeWaveMQServer(handler)
+        try:
+            with WaveMQClient(server.broker, metadata_ttl=60.0) as client:
+                ensured = client.ensure_topic("demo", partitions=1, replication_factor=1)
+                self.assertEqual("demo", ensured.topic)
+                self.assertEqual(1, ensured.partitions)
+                self.assertEqual(1, ensured.replication_factor)
+
+                fetched = client.fetch_from_offset("demo", 0, 0)
+                self.assertEqual([0, 1], [record.offset for record in fetched.records])
+
+                latest = client.fetch_latest("demo", 0)
+                self.assertEqual([1], [record.offset for record in latest.records])
+
+                seen: list[int] = []
+                result = client.consume_poll(
+                    "g",
+                    "demo",
+                    0,
+                    next_offset=0,
+                    on_record=lambda record: seen.append(record.offset),
+                    poll_interval=0.0,
+                    stop_when_caught_up=True,
+                )
+                self.assertEqual(2, len(result.records))
+                self.assertEqual(0, result.start_offset)
+                self.assertEqual(2, result.next_offset)
+                self.assertEqual(1, result.high_watermark)
+                self.assertEqual(1, result.committed_offset)
+                self.assertEqual([0, 1], seen)
+                self.assertEqual([("g", "demo", 0, 0), ("g", "demo", 0, 1)], state["commits"])
+                self.assertEqual([0, 1, 0], state["fetch_offsets"])
+        finally:
+            server.close()
+            server.assert_ok()
+
     def test_http_roundtrip_and_cache(self) -> None:
         server = FakeWaveMQHTTPServer()
         try:
@@ -365,6 +446,109 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(5, client.fetch_committed("g", "demo", 0).offset)
         finally:
             server.close()
+
+    def test_high_level_topic_and_fetch_helpers(self) -> None:
+        client = WaveMQClient("127.0.0.1:1")
+        try:
+            with mock.patch.object(
+                client,
+                "create_topic",
+                return_value=CreateTopicResult(topic="demo", partitions=1, replication_factor=1),
+            ) as create_topic:
+                ensured = client.ensure_topic("demo")
+                self.assertTrue(ensured.created)
+                self.assertEqual("demo", ensured.topic)
+                create_topic.assert_called_once_with("demo", partitions=1, replication_factor=1)
+
+            with mock.patch.object(client, "create_topic", side_effect=TopicExistsError("exists")):
+                ensured = client.ensure_topic("demo")
+                self.assertFalse(ensured.created)
+
+            expected_fetch = FetchResult(records=(Record(offset=7, value=b"value"),), high_watermark=7)
+            with (
+                mock.patch.object(client, "list_offsets", return_value=ListOffsetsResult(earliest=0, latest=7)) as list_offsets,
+                mock.patch.object(client, "fetch", return_value=expected_fetch) as fetch,
+            ):
+                fetched = client.fetch_latest("demo", 0)
+                self.assertEqual(expected_fetch, fetched)
+                list_offsets.assert_called_once_with("demo", 0)
+                fetch.assert_called_once_with("demo", 0, 7, max_bytes=1_048_576)
+        finally:
+            client.close()
+
+    def test_resolve_consume_offset_prefers_committed_then_falls_back(self) -> None:
+        client = WaveMQClient("127.0.0.1:1")
+        try:
+            with mock.patch.object(
+                client,
+                "fetch_committed",
+                return_value=FetchCommittedResult(offset=11),
+            ) as fetch_committed:
+                self.assertEqual(12, client.resolve_consume_offset("g", "demo", 0))
+                fetch_committed.assert_called_once_with("g", "demo", 0)
+
+            with (
+                mock.patch.object(client, "fetch_committed", side_effect=TopicExistsError("missing commit")),
+                mock.patch.object(client, "list_offsets", return_value=ListOffsetsResult(earliest=3, latest=9)),
+            ):
+                self.assertEqual(
+                    10,
+                    client.resolve_consume_offset("g", "demo", 0, start_from="latest"),
+                )
+                self.assertEqual(
+                    3,
+                    client.resolve_consume_offset("g", "demo", 0, start_from="earliest"),
+                )
+                self.assertEqual(
+                    5,
+                    client.resolve_consume_offset("g", "demo", 0, start_from="offset", start_offset=5),
+                )
+        finally:
+            client.close()
+
+    def test_consume_poll_commits_and_returns_next_offset(self) -> None:
+        client = WaveMQClient("127.0.0.1:1")
+        seen: list[int] = []
+        try:
+            fetched = FetchResult(
+                records=(
+                    Record(offset=5, value=b"a"),
+                    Record(offset=6, value=b"b"),
+                ),
+                high_watermark=6,
+            )
+            with (
+                mock.patch.object(client, "fetch", return_value=fetched) as fetch,
+                mock.patch.object(client, "commit_offset") as commit_offset,
+            ):
+                result = client.consume_poll(
+                    "g",
+                    "demo",
+                    0,
+                    next_offset=5,
+                    max_messages=2,
+                    poll_interval=0,
+                    commit=True,
+                    stop_when_caught_up=True,
+                    on_record=lambda record: seen.append(record.offset),
+                )
+
+            fetch.assert_called_once_with("demo", 0, 5, max_bytes=1_048_576)
+            self.assertEqual([5, 6], seen)
+            self.assertEqual(2, len(result.records))
+            self.assertEqual(5, result.start_offset)
+            self.assertEqual(7, result.next_offset)
+            self.assertEqual(6, result.high_watermark)
+            self.assertEqual(6, result.committed_offset)
+            self.assertEqual(
+                [
+                    mock.call("g", "demo", 0, 5),
+                    mock.call("g", "demo", 0, 6),
+                ],
+                commit_offset.call_args_list,
+            )
+        finally:
+            client.close()
 
 
 if __name__ == "__main__":

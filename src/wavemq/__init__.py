@@ -13,7 +13,9 @@ from .errors import (
 )
 from .models import (
     CommitOffsetResult,
+    ConsumePollResult,
     CreateTopicResult,
+    EnsureTopicResult,
     FetchCommittedResult,
     FetchResult,
     Header,
@@ -50,4 +52,6 @@ __all__ = [
     "ListOffsetsResult",
     "CommitOffsetResult",
     "FetchCommittedResult",
+    "EnsureTopicResult",
+    "ConsumePollResult",
 ]

@@ -6,13 +6,15 @@ import socket
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from .errors import (
     UnsupportedFeatureError,
+    TopicExistsError,
+    WaveMQBrokerError,
     WaveMQConnectionError,
     WaveMQProtocolError,
     broker_exception_for_error_code,
@@ -20,7 +22,9 @@ from .errors import (
 )
 from .models import (
     CommitOffsetResult,
+    ConsumePollResult,
     CreateTopicResult,
+    EnsureTopicResult,
     FetchCommittedResult,
     FetchResult,
     ListOffsetsResult,
@@ -365,6 +369,28 @@ class WaveMQClient:
         self._raise_for_error(response.error, f"create-topic {topic}")
         return CreateTopicResult(topic=topic, partitions=partitions, replication_factor=replication_factor)
 
+    def ensure_topic(
+        self,
+        topic: str,
+        partitions: int = 1,
+        replication_factor: int = 1,
+    ) -> EnsureTopicResult:
+        try:
+            created = self.create_topic(topic, partitions=partitions, replication_factor=replication_factor)
+            return EnsureTopicResult(
+                topic=created.topic,
+                partitions=created.partitions,
+                replication_factor=created.replication_factor,
+                created=True,
+            )
+        except TopicExistsError:
+            return EnsureTopicResult(
+                topic=topic,
+                partitions=partitions,
+                replication_factor=replication_factor,
+                created=False,
+            )
+
     def produce(
         self,
         topic: str,
@@ -382,6 +408,24 @@ class WaveMQClient:
         self._raise_for_error(response.error, f"produce {topic}/{partition}")
         return ProduceResult(base_offset=response.base_offset)
 
+    def produce_one(
+        self,
+        topic: str,
+        partition: int,
+        value: Record | bytes | str,
+        key: bytes | str | None = None,
+    ) -> ProduceResult:
+        return self.produce(topic, partition, [value], key=key)
+
+    def produce_many(
+        self,
+        topic: str,
+        partition: int,
+        values: Sequence[Record | bytes | str],
+        key: bytes | str | None = None,
+    ) -> ProduceResult:
+        return self.produce(topic, partition, values, key=key)
+
     def fetch(
         self,
         topic: str,
@@ -397,6 +441,26 @@ class WaveMQClient:
         )
         self._raise_for_error(response.error, f"fetch {topic}/{partition}")
         return FetchResult(records=response.records, high_watermark=response.high_watermark)
+
+    def fetch_from_offset(
+        self,
+        topic: str,
+        partition: int,
+        offset: int,
+        max_bytes: int = 1_048_576,
+    ) -> FetchResult:
+        return self.fetch(topic, partition, offset, max_bytes=max_bytes)
+
+    def fetch_latest(
+        self,
+        topic: str,
+        partition: int,
+        max_bytes: int = 1_048_576,
+    ) -> FetchResult:
+        offsets = self.list_offsets(topic, partition)
+        if offsets.latest < 0:
+            return FetchResult(records=(), high_watermark=-1)
+        return self.fetch(topic, partition, offsets.latest, max_bytes=max_bytes)
 
     def metadata(self, topics: Iterable[str] | str | None = None) -> MetadataResult:
         topics_tuple = normalize_topics(()) if topics is None else normalize_topics(topics)
@@ -450,6 +514,117 @@ class WaveMQClient:
         )
         self._raise_for_error(response.error, f"fetch-committed {group} {topic}/{partition}")
         return FetchCommittedResult(offset=response.offset)
+
+    def resolve_consume_offset(
+        self,
+        group: str,
+        topic: str,
+        partition: int,
+        *,
+        start_from: str = "latest",
+        start_offset: int = 0,
+        use_committed: bool = True,
+    ) -> int:
+        mode = start_from.strip().lower()
+        if mode not in {"latest", "earliest", "offset"}:
+            raise ValueError(f"unsupported start_from {start_from!r}")
+
+        if use_committed:
+            try:
+                return self.fetch_committed(group, topic, partition).offset + 1
+            except WaveMQBrokerError:
+                pass
+
+        if mode == "offset":
+            return int(start_offset)
+
+        offsets = self.list_offsets(topic, partition)
+        if mode == "earliest":
+            return offsets.earliest
+
+        return 0 if offsets.latest < 0 else offsets.latest + 1
+
+    def consume_poll(
+        self,
+        group: str,
+        topic: str,
+        partition: int,
+        *,
+        next_offset: int | None = None,
+        start_from: str = "latest",
+        start_offset: int = 0,
+        use_committed: bool = True,
+        max_messages: int = 0,
+        poll_interval: float = 1.0,
+        max_bytes: int = 1_048_576,
+        commit: bool = True,
+        stop_when_caught_up: bool = False,
+        on_record: Callable[[Record], None] | None = None,
+    ) -> ConsumePollResult:
+        if max_messages < 0:
+            raise ValueError("max_messages must be >= 0")
+        if poll_interval < 0:
+            raise ValueError("poll_interval must be >= 0")
+
+        if next_offset is None:
+            next_offset = self.resolve_consume_offset(
+                group,
+                topic,
+                partition,
+                start_from=start_from,
+                start_offset=start_offset,
+                use_committed=use_committed,
+            )
+
+        started_offset = next_offset
+        committed_offset: int | None = None
+        high_watermark = -1
+        collected: list[Record] = []
+
+        while max_messages <= 0 or len(collected) < max_messages:
+            try:
+                fetched = self.fetch(topic, partition, next_offset, max_bytes=max_bytes)
+            except WaveMQConnectionError:
+                time.sleep(poll_interval)
+                continue
+
+            high_watermark = fetched.high_watermark
+            visible = tuple(record for record in fetched.records if record.offset >= next_offset)
+
+            if not fetched.records:
+                if stop_when_caught_up and fetched.high_watermark >= 0 and next_offset > fetched.high_watermark:
+                    break
+                time.sleep(poll_interval)
+                continue
+
+            for record in visible:
+                if record.offset < next_offset:
+                    continue
+                if on_record is not None:
+                    on_record(record)
+                if commit:
+                    self.commit_offset(group, topic, partition, record.offset)
+                    committed_offset = record.offset
+                next_offset = record.offset + 1
+                collected.append(record)
+                if max_messages > 0 and len(collected) >= max_messages:
+                    break
+
+            if max_messages > 0 and len(collected) >= max_messages:
+                break
+
+            if stop_when_caught_up and high_watermark >= 0 and next_offset > high_watermark:
+                break
+
+            time.sleep(poll_interval)
+
+        return ConsumePollResult(
+            records=tuple(collected),
+            start_offset=started_offset,
+            next_offset=next_offset,
+            high_watermark=high_watermark,
+            committed_offset=committed_offset,
+        )
 
     def _raise_for_error(self, error_code: int, action: str) -> None:
         if error_code == 0:
