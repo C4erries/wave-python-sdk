@@ -8,7 +8,15 @@ from datetime import datetime, timezone
 from typing import BinaryIO, Sequence
 
 from .errors import WaveMQProtocolError
-from .models import Header, MetadataResult, PartitionMetadata, PartitionRole, Record
+from .models import (
+    Header,
+    MetadataResult,
+    PartitionMetadata,
+    PartitionRole,
+    Record,
+    canonicalize_record_content_type,
+    content_type_from_headers,
+)
 
 API_KEY_CREATE_TOPIC = 0
 API_KEY_PRODUCE = 1
@@ -401,6 +409,7 @@ def decode_list_offsets_response(payload: bytes) -> ListOffsetsResponseWire:
 
 
 def encode_record(record: Record) -> bytes:
+    record = canonicalize_record_content_type(record)
     buf = io.BytesIO()
     timestamp_ns = _datetime_to_unix_nanos(record.timestamp)
     _write_int64(buf, int(record.offset))
@@ -425,7 +434,15 @@ def decode_record(stream: BinaryIO) -> Record:
     for _ in range(headers_count):
         headers.append(Header(key=_read_string(stream), value=_read_bytes(stream)))
     timestamp = _unix_nanos_to_datetime(timestamp_ns)
-    return Record(offset=offset, timestamp=timestamp, key=key, value=value, headers=tuple(headers))
+    header_tuple = tuple(headers)
+    return Record(
+        offset=offset,
+        timestamp=timestamp,
+        key=key,
+        value=value,
+        headers=header_tuple,
+        content_type=content_type_from_headers(header_tuple),
+    )
 
 
 def _read_exact(stream: BinaryIO, size: int) -> bytes:

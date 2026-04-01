@@ -51,6 +51,8 @@ For tiny scripts and preview examples, the client also exposes additive helpers:
 - `resolve_consume_offset(...)`
 - `consume_poll(...)`
 
+`Record` also supports `content_type`, which maps to the canonical `content-type` header on TCP and to the `contentType` JSON field on HTTP.
+
 ## Examples
 
 Runnable examples live in:

@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from enum import IntEnum
 from typing import Tuple
 
+CONTENT_TYPE_HEADER = "content-type"
+
 
 class PartitionRole(IntEnum):
     LEADER = 0
@@ -24,6 +26,7 @@ class Record:
     key: bytes | None = None
     value: bytes | None = None
     headers: Tuple[Header, ...] = ()
+    content_type: str | None = None
     crc32c: int = 0
 
 
@@ -103,3 +106,62 @@ class ConsumePollResult:
     next_offset: int
     high_watermark: int
     committed_offset: int | None = None
+
+
+def normalize_content_type(value: str | None) -> str | None:
+    if value is None:
+        return None
+
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError("content_type must not be empty")
+
+    return normalized
+
+
+def content_type_from_headers(headers: Tuple[Header, ...]) -> str | None:
+    found: str | None = None
+
+    for header in headers:
+        if header.key.lower() != CONTENT_TYPE_HEADER:
+            continue
+        if header.value is None:
+            raise ValueError("content-type header must have a value")
+        try:
+            current = header.value.decode("utf-8").strip()
+        except UnicodeDecodeError as exc:
+            raise ValueError("content-type header must be utf-8") from exc
+        if not current:
+            raise ValueError("content-type header must not be empty")
+        if found is None:
+            found = current
+            continue
+        if found != current:
+            raise ValueError("conflicting content-type headers")
+
+    return found
+
+
+def canonicalize_record_content_type(record: Record) -> Record:
+    header_content_type = content_type_from_headers(record.headers)
+    record_content_type = normalize_content_type(record.content_type)
+
+    if header_content_type is not None and record_content_type is not None and header_content_type != record_content_type:
+        raise ValueError("content_type does not match content-type header")
+
+    resolved = record_content_type or header_content_type
+    headers = tuple(
+        header for header in record.headers if header.key.lower() != CONTENT_TYPE_HEADER
+    )
+    if resolved is not None:
+        headers = headers + (Header(CONTENT_TYPE_HEADER, resolved.encode("utf-8")),)
+
+    return Record(
+        offset=record.offset,
+        timestamp=record.timestamp,
+        key=record.key,
+        value=record.value,
+        headers=headers,
+        content_type=resolved,
+        crc32c=record.crc32c,
+    )

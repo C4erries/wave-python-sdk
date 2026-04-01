@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from wavemq import TopicExistsError, WaveMQClient  # noqa: E402
+from wavemq import Header, Record, TopicExistsError, UnsupportedFeatureError, WaveMQClient  # noqa: E402
 from wavemq.models import (  # noqa: E402
     CreateTopicResult,
     FetchCommittedResult,
@@ -188,12 +188,14 @@ class FakeWaveMQHTTPServer:
                 if parsed.path == "/api/topics/demo/partitions/0/messages":
                     offset = outer.state["next_offset"]
                     outer.state["next_offset"] += 1
+                    content_type = data.get("contentType")
                     outer.state["messages"].append(
                         {
                             "partition": 0,
                             "offset": offset,
                             "key": data.get("key"),
                             "value": data.get("value"),
+                            "contentType": content_type,
                             "timestamp": "2026-03-18T10:00:00Z",
                         }
                     )
@@ -282,6 +284,11 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(1, len(records))
                 self.assertEqual(b"demo-key", records[0].key)
                 self.assertEqual(b"hello", records[0].value)
+                self.assertEqual("application/json", records[0].content_type)
+                self.assertEqual(
+                    (Header("content-type", b"application/json"),),
+                    records[0].headers,
+                )
                 return api_key, encode_produce_response(3, 0)
             if api_key == API_KEY_FETCH:
                 self.assertEqual(("demo", 0, 0, 1_048_576), decode_fetch_request(payload))
@@ -328,7 +335,11 @@ class ClientTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     3,
-                    client.produce("demo", 0, ["hello"], key="demo-key").base_offset,
+                    client.produce(
+                        "demo",
+                        0,
+                        [Record(key=b"demo-key", value=b"hello", content_type="application/json")],
+                    ).base_offset,
                 )
                 fetched = client.fetch("demo", 0, 0)
                 self.assertEqual(2, len(fetched.records))
@@ -428,12 +439,21 @@ class ClientTests(unittest.TestCase):
                 self.assertGreaterEqual(client.ping().rtt_ms, 0.0)
                 created = client.create_topic("demo", partitions=1, replication_factor=1)
                 self.assertEqual("demo", created.topic)
-                produced = client.produce("demo", 0, ["hello", "world"], key="demo-key")
+                produced = client.produce(
+                    "demo",
+                    0,
+                    [Record(key=b"demo-key", value=b"hello", content_type="text/plain")],
+                )
                 self.assertEqual(3, produced.base_offset)
                 fetched = client.fetch("demo", 0, offset=3)
-                self.assertEqual(2, len(fetched.records))
+                self.assertEqual(1, len(fetched.records))
                 self.assertEqual(b"hello", fetched.records[0].value)
-                self.assertEqual(4, fetched.high_watermark)
+                self.assertEqual("text/plain", fetched.records[0].content_type)
+                self.assertEqual(
+                    (Header("content-type", b"text/plain"),),
+                    fetched.records[0].headers,
+                )
+                self.assertEqual(3, fetched.high_watermark)
                 metadata = client.metadata("demo")
                 self.assertEqual(1, len(metadata.partitions))
                 self.assertEqual(1, metadata.partitions[0].broker_id)
@@ -441,11 +461,62 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(1, len(client.metadata("demo").partitions))
                 self.assertEqual(metadata_calls, server.state["metadata_calls"])
                 self.assertEqual(0, client.list_offsets("demo", 0).earliest)
-                self.assertEqual(4, client.list_offsets("demo", 0).latest)
+                self.assertEqual(3, client.list_offsets("demo", 0).latest)
                 self.assertEqual(5, client.commit_offset("g", "demo", 0, 5).offset)
                 self.assertEqual(5, client.fetch_committed("g", "demo", 0).offset)
+                self.assertEqual("text/plain", server.state["messages"][0]["contentType"])
         finally:
             server.close()
+
+    def test_http_binary_content_type_forces_base64_request(self) -> None:
+        server = FakeWaveMQHTTPServer()
+        try:
+            with WaveMQClient(server.broker, transport="http") as client:
+                produced = client.produce(
+                    "demo",
+                    0,
+                    [Record(value=bytes.fromhex("4029000000000000"), content_type="application/x.float64")],
+                )
+                self.assertEqual(3, produced.base_offset)
+                self.assertEqual("application/x.float64", server.state["messages"][0]["contentType"])
+                self.assertEqual("base64:QCkAAAAAAAA=", server.state["messages"][0]["value"])
+
+                fetched = client.fetch("demo", 0, offset=3)
+                self.assertEqual(1, len(fetched.records))
+                self.assertEqual(bytes.fromhex("4029000000000000"), fetched.records[0].value)
+                self.assertEqual("application/x.float64", fetched.records[0].content_type)
+        finally:
+            server.close()
+
+    def test_http_rejects_non_content_type_headers(self) -> None:
+        client = WaveMQClient("http://127.0.0.1:8090", transport="http")
+        try:
+            with self.assertRaises(UnsupportedFeatureError):
+                client.produce(
+                    "demo",
+                    0,
+                    [Record(value=b"hello", headers=(Header("x-test", b"1"),))],
+                )
+        finally:
+            client.close()
+
+    def test_content_type_conflict_rejected(self) -> None:
+        client = WaveMQClient("127.0.0.1:1")
+        try:
+            with self.assertRaises(ValueError):
+                client.produce(
+                    "demo",
+                    0,
+                    [
+                        Record(
+                            value=b"hello",
+                            headers=(Header("content-type", b"text/plain"),),
+                            content_type="application/json",
+                        )
+                    ],
+                )
+        finally:
+            client.close()
 
     def test_high_level_topic_and_fetch_helpers(self) -> None:
         client = WaveMQClient("127.0.0.1:1")

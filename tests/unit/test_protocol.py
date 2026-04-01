@@ -44,14 +44,29 @@ class ProtocolTests(unittest.TestCase):
             key=b"k",
             value=b"v",
             headers=(Header("h1", b"hv"), Header("h2", None)),
+            content_type="application/x.float64",
         )
         payload = encode_record(record)
         decoded = decode_record(io.BytesIO(payload))
         self.assertEqual(record.offset, decoded.offset)
         self.assertEqual(record.key, decoded.key)
         self.assertEqual(record.value, decoded.value)
-        self.assertEqual(record.headers, decoded.headers)
+        self.assertEqual(
+            (Header("h1", b"hv"), Header("h2", None), Header("content-type", b"application/x.float64")),
+            decoded.headers,
+        )
+        self.assertEqual("application/x.float64", decoded.content_type)
         self.assertEqual(record.timestamp, decoded.timestamp)
+
+    def test_record_roundtrip_rejects_conflicting_content_type(self) -> None:
+        record = Record(
+            key=b"k",
+            value=b"v",
+            headers=(Header("content-type", b"text/plain"),),
+            content_type="application/json",
+        )
+        with self.assertRaises(ValueError):
+            encode_record(record)
 
     def test_request_encoding_decoding(self) -> None:
         payload = encode_create_topic_request("demo", 3, 2)
@@ -95,4 +110,3 @@ class ProtocolTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

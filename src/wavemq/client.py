@@ -27,6 +27,7 @@ from .models import (
     EnsureTopicResult,
     FetchCommittedResult,
     FetchResult,
+    Header,
     ListOffsetsResult,
     MetadataResult,
     PartitionMetadata,
@@ -34,6 +35,9 @@ from .models import (
     PingResult,
     ProduceResult,
     Record,
+    canonicalize_record_content_type,
+    content_type_from_headers,
+    normalize_content_type,
 )
 from .protocol import (
     API_KEY_COMMIT_OFFSET,
@@ -172,14 +176,12 @@ class _HttpTransport:
         base_offset: int | None = None
         path = f"/api/topics/{quote(topic, safe='')}/partitions/{partition}/messages"
         for record in records:
-            if record.headers:
-                raise UnsupportedFeatureError(
-                    "http transport does not support record headers",
-                    broker=self.broker,
-                )
-            payload: dict[str, Any] = {"value": _encode_record_bytes(record.value)}
+            content_type = _http_record_content_type(record, broker=self.broker)
+            payload: dict[str, Any] = {"value": _encode_http_record_bytes(record.value, content_type)}
             if record.key is not None:
                 payload["key"] = _encode_record_bytes(record.key)
+            if content_type is not None:
+                payload["contentType"] = content_type
             try:
                 data = self._request_json("POST", path, payload=payload)
             except HTTPError as exc:
@@ -207,7 +209,7 @@ class _HttpTransport:
             raise WaveMQProtocolError("expected list response for fetch", broker=self.broker)
         records = tuple(
             item
-            for item in sorted((_record_from_http(item) for item in data), key=lambda item: item.offset)
+            for item in sorted((_record_from_http(item, broker=self.broker) for item in data), key=lambda item: item.offset)
             if item.offset >= offset
         )
         return FetchResult(records=records, high_watermark=high_watermark)
@@ -397,8 +399,9 @@ class WaveMQClient:
         partition: int,
         records: Sequence[Record | bytes | str],
         key: bytes | str | None = None,
+        content_type: str | None = None,
     ) -> ProduceResult:
-        encoded_records = _coerce_records(records, key=key)
+        encoded_records = _coerce_records(records, key=key, content_type=content_type)
         if self._transport_name == "http":
             return self._transport.produce(topic, partition, encoded_records)
 
@@ -414,8 +417,9 @@ class WaveMQClient:
         partition: int,
         value: Record | bytes | str,
         key: bytes | str | None = None,
+        content_type: str | None = None,
     ) -> ProduceResult:
-        return self.produce(topic, partition, [value], key=key)
+        return self.produce(topic, partition, [value], key=key, content_type=content_type)
 
     def produce_many(
         self,
@@ -423,8 +427,9 @@ class WaveMQClient:
         partition: int,
         values: Sequence[Record | bytes | str],
         key: bytes | str | None = None,
+        content_type: str | None = None,
     ) -> ProduceResult:
-        return self.produce(topic, partition, values, key=key)
+        return self.produce(topic, partition, values, key=key, content_type=content_type)
 
     def fetch(
         self,
@@ -648,22 +653,27 @@ def _parse_broker(broker: str) -> tuple[str, int]:
     return host, port
 
 
-def _coerce_records(records: Sequence[Record | bytes | str], key: bytes | str | None = None) -> tuple[Record, ...]:
+def _coerce_records(
+    records: Sequence[Record | bytes | str],
+    key: bytes | str | None = None,
+    content_type: str | None = None,
+) -> tuple[Record, ...]:
     if isinstance(key, str):
         key_bytes = key.encode("utf-8")
     else:
         key_bytes = key
+    normalized_content_type = normalize_content_type(content_type)
 
     normalized: list[Record] = []
     for item in records:
         if isinstance(item, Record):
-            normalized.append(item)
+            normalized.append(_apply_record_content_type(item, normalized_content_type))
             continue
         if isinstance(item, str):
             value = item.encode("utf-8")
         else:
             value = item
-        normalized.append(Record(key=key_bytes, value=value))
+        normalized.append(Record(key=key_bytes, value=value, content_type=normalized_content_type))
 
     return tuple(normalized)
 
@@ -699,17 +709,78 @@ def _encode_record_bytes(value: bytes | None) -> str:
     return text
 
 
-def _record_from_http(data: dict[str, Any]) -> Record:
+def _encode_http_record_bytes(value: bytes | None, content_type: str | None) -> str:
+    if value is None:
+        return ""
+    if content_type is not None and not _is_text_content_type(content_type):
+        return "base64:" + base64.b64encode(value).decode("ascii")
+    return _encode_record_bytes(value)
+
+
+def _record_from_http(data: dict[str, Any], *, broker: str | None = None) -> Record:
     timestamp_text = str(data.get("timestamp", ""))
     if timestamp_text.endswith("Z"):
         timestamp_text = timestamp_text[:-1] + "+00:00"
     timestamp = datetime.fromisoformat(timestamp_text) if timestamp_text else datetime.now(timezone.utc)
+    content_type = _decode_content_type(data.get("contentType"), broker=broker)
+    headers = ()
+    if content_type is not None:
+        headers = (Header(key="content-type", value=content_type.encode("utf-8")),)
     return Record(
         offset=int(data.get("offset", -1)),
         timestamp=timestamp,
         key=_decode_maybe_base64(data.get("key")),
         value=_decode_maybe_base64(data.get("value")),
+        headers=headers,
+        content_type=content_type,
     )
+
+
+def _decode_content_type(value: Any, broker: str | None = None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise WaveMQProtocolError("contentType must be a string", broker=broker)
+    return normalize_content_type(value)
+
+
+def _http_record_content_type(record: Record, *, broker: str | None = None) -> str | None:
+    header_content_type = content_type_from_headers(record.headers)
+    record_content_type = normalize_content_type(record.content_type)
+
+    if header_content_type is not None and record_content_type is not None and header_content_type != record_content_type:
+        raise ValueError("content_type does not match content-type header")
+
+    other_headers = [header for header in record.headers if header.key.lower() != "content-type"]
+    if other_headers:
+        raise UnsupportedFeatureError(
+            "http transport does not support record headers other than content-type",
+            broker=broker,
+        )
+
+    return record_content_type or header_content_type
+
+
+def _apply_record_content_type(record: Record, content_type: str | None) -> Record:
+    if content_type is None:
+        return canonicalize_record_content_type(record)
+
+    return canonicalize_record_content_type(
+        Record(
+            offset=record.offset,
+            timestamp=record.timestamp,
+            key=record.key,
+            value=record.value,
+            headers=record.headers,
+            content_type=content_type,
+            crc32c=record.crc32c,
+        )
+    )
+
+
+def _is_text_content_type(content_type: str) -> bool:
+    normalized = content_type.lower()
+    return normalized.startswith("text/") or normalized == "application/json" or normalized.endswith("+json")
 
 
 def _partition_metadata_from_http(topic: str, data: dict[str, Any]) -> PartitionMetadata:
