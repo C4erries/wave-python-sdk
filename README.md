@@ -1,25 +1,19 @@
 # wavemq
 
-Python SDK for `wave-mq` with the same client API over either the custom binary protocol or HTTP.
+`wavemq` is the Python SDK for `wave-mq`. It provides one client API over two transports:
 
-The first version is intentionally small:
+- `transport="tcp"` for the custom binary protocol
+- `transport="http"` for the broker HTTP API
 
-- `WaveMQClient(broker, transport="tcp" | "http")`
-- binary protocol over plain TCP or JSON HTTP API
-- typed result models and protocol errors
-- no external runtime dependencies
+TCP is the default and is the best fit for binary payloads. HTTP is useful for preview flows and simpler integrations.
 
-For beginner-friendly flows, the client also exposes additive helpers:
+## Install
 
-- `ensure_topic(...)`
-- `produce_one(...)`
-- `produce_many(...)`
-- `fetch_from_offset(...)`
-- `fetch_latest(...)`
-- `resolve_consume_offset(...)`
-- `consume_poll(...)`
+```powershell
+python -m pip install wave-python-sdk
+```
 
-## Example
+## Quick start
 
 ```python
 from wavemq import WaveMQClient
@@ -32,7 +26,7 @@ with WaveMQClient("127.0.0.1:7912") as client:
     print(result.records[0].value)
 ```
 
-HTTP uses the same client surface:
+HTTP uses the same surface:
 
 ```python
 from wavemq import WaveMQClient
@@ -45,26 +39,29 @@ with WaveMQClient("http://127.0.0.1:8090", transport="http") as client:
     print(result.records[0].value)
 ```
 
-The higher-level helpers are transport-agnostic as well and are useful for tiny producer/consumer mains and replay-style examples.
+## Helper API
 
-```python
-from wavemq import WaveMQClient
+For tiny scripts and preview examples, the client also exposes additive helpers:
 
-with WaveMQClient("127.0.0.1:7912") as client:
-    client.ensure_topic("demo")
-    client.produce_one("demo", 0, "hello", key="demo-key")
+- `ensure_topic(...)`
+- `produce_one(...)`
+- `produce_many(...)`
+- `fetch_from_offset(...)`
+- `fetch_latest(...)`
+- `resolve_consume_offset(...)`
+- `consume_poll(...)`
 
-    def handle(record):
-        print(record.offset, record.value)
+## Examples
 
-    start = client.resolve_consume_offset("demo-group", "demo", 0, start_from="latest")
-    client.consume_poll(
-        "demo-group",
-        "demo",
-        0,
-        next_offset=start,
-        max_messages=1,
-        commit=True,
-        on_record=handle,
-    )
-```
+Runnable examples live in:
+
+- `examples/python/sdk/tcp`
+- `examples/python/sdk/http`
+
+The TCP folder also contains `simple` in-file producer/consumer/replay scripts for quick manual checks and offset reruns.
+
+## Notes
+
+- Use `transport="tcp"` if you need raw bytes and the binary protocol.
+- Use `transport="http"` if you want a broker-address-only integration path.
+- The package is intentionally small and has no runtime dependencies beyond the standard library.
