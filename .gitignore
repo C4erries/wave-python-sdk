@@ -1,0 +1,4 @@
+dist/
+build/
+*.egg-info/
+wave_python_sdk.egg-info/
